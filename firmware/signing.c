@@ -45,10 +45,12 @@ enum {
 	STAGE_REQUEST_3_OUTPUT,
 	STAGE_REQUEST_4_INPUT,
 	STAGE_REQUEST_4_OUTPUT,
+	STAGE_REQUEST_4_EXTRADATA,
 	STAGE_REQUEST_SEGWIT_INPUT,
 	STAGE_REQUEST_5_OUTPUT,
 	STAGE_REQUEST_SEGWIT_WITNESS,
-	STAGE_REQUEST_DECRED_WITNESS
+	STAGE_REQUEST_DECRED_WITNESS,
+	STAGE_REQUEST_5_EXTRADATA
 } signing_stage;
 static uint32_t idx1, idx2;
 static uint32_t signatures;
@@ -76,6 +78,7 @@ static uint8_t multisig_fp[32];
 static uint32_t in_address_n[8];
 static size_t in_address_n_count;
 static uint32_t tx_weight;
+static uint32_t extra_data_len;
 
 /* A marker for in_address_n_count to indicate a mismatch in bip32 paths in
    input */
@@ -176,6 +179,7 @@ foreach I (idx1):  // input to sign
             Request O                                                 STAGE_REQUEST_4_OUTPUT
             Add O to StreamTransactionSign
             Add O to TransactionChecksum
+        Request extra data (if applicable)                            STAGE_REQUEST_4_EXTRADATA
 
         Compare TransactionChecksum with checksum computed in Phase 1
         If different:
@@ -187,7 +191,7 @@ foreach O (idx1):
     Request O                                                         STAGE_REQUEST_5_OUTPUT
     Rewrite change address
     Return O
-
+Request extra data (if applicable) and add to serialized tx data
 
 Phase3: sign segwit inputs, check that nothing changed
 ===============================================
@@ -310,6 +314,19 @@ void send_req_4_output(void)
 	msg_write(MessageType_MessageType_TxRequest, &resp);
 }
 
+void send_req_4_extradata(uint32_t chunk_offset, uint32_t chunk_len)
+{
+	signing_stage = STAGE_REQUEST_4_EXTRADATA;
+	resp.has_request_type = true;
+	resp.request_type = RequestType_TXEXTRADATA;
+	resp.has_details = true;
+	resp.details.has_extra_data_offset = true;
+	resp.details.extra_data_offset = chunk_offset;
+	resp.details.has_extra_data_len = true;
+	resp.details.extra_data_len = chunk_len;
+	msg_write(MessageType_MessageType_TxRequest, &resp);
+}
+
 void send_req_segwit_input(void)
 {
 	signing_stage = STAGE_REQUEST_SEGWIT_INPUT;
@@ -351,6 +368,19 @@ void send_req_5_output(void)
 	resp.has_details = true;
 	resp.details.has_request_index = true;
 	resp.details.request_index = idx1;
+	msg_write(MessageType_MessageType_TxRequest, &resp);
+}
+
+void send_req_5_extradata(uint32_t chunk_offset, uint32_t chunk_len)
+{
+	signing_stage = STAGE_REQUEST_5_EXTRADATA;
+	resp.has_request_type = true;
+	resp.request_type = RequestType_TXEXTRADATA;
+	resp.has_details = true;
+	resp.details.has_extra_data_offset = true;
+	resp.details.extra_data_offset = chunk_offset;
+	resp.details.has_extra_data_len = true;
+	resp.details.extra_data_len = chunk_len;
 	msg_write(MessageType_MessageType_TxRequest, &resp);
 }
 
@@ -487,8 +517,11 @@ void signing_init(const SignTx *msg, const CoinInfo *_coin, const HDNode *_root)
 	overwintered = msg->has_overwintered && msg->overwintered;
 	version_group_id = msg->version_group_id;
 	branch_id = msg->branch_id;
+	extra_data_len = 0;
+	if(msg->has_extra_data_len)
+		extra_data_len = msg->extra_data_len;
 
-	uint32_t size = TXSIZE_HEADER + TXSIZE_FOOTER + ser_length_size(inputs_count) + ser_length_size(outputs_count);
+	uint32_t size = TXSIZE_HEADER + TXSIZE_FOOTER + ser_length_size(inputs_count) + ser_length_size(outputs_count) + extra_data_len;
 	if (coin->decred) {
 		size += 4; // Decred expiry
 		size += ser_length_size(inputs_count); // Witness inputs count
@@ -516,7 +549,7 @@ void signing_init(const SignTx *msg, const CoinInfo *_coin, const HDNode *_root)
 	multisig_fp_mismatch = false;
 	next_nonsegwit_input = 0xffffffff;
 
-	tx_init(&to, inputs_count, outputs_count, version, lock_time, expiry, 0, coin->curve->hasher_sign, overwintered, version_group_id);
+	tx_init(&to, inputs_count, outputs_count, version, lock_time, expiry, extra_data_len, coin->curve->hasher_sign, overwintered, version_group_id);
 
 	if (coin->decred) {
 		to.version |= (DECRED_SERIALIZE_FULL << 16);
@@ -1170,7 +1203,7 @@ void signing_txack(TransactionType *tx)
 		case STAGE_REQUEST_4_INPUT:
 			progress = 500 + ((signatures * progress_step + idx2 * progress_meta_step) >> PROGRESS_PRECISION);
 			if (idx2 == 0) {
-				tx_init(&ti, inputs_count, outputs_count, version, lock_time, expiry, 0, coin->curve->hasher_sign, overwintered, version_group_id);
+				tx_init(&ti, inputs_count, outputs_count, version, lock_time, expiry, extra_data_len, coin->curve->hasher_sign, overwintered, version_group_id);
 				hasher_Reset(&hasher_check);
 			}
 			// check prevouts and script type
@@ -1232,24 +1265,55 @@ void signing_txack(TransactionType *tx)
 				idx2++;
 				send_req_4_output();
 			} else {
-				if (!signing_sign_input()) {
-					return;
-				}
-				// since this took a longer time, update progress
-				signatures++;
-				progress = 500 + ((signatures * progress_step) >> PROGRESS_PRECISION);
-				layoutProgress(_("Signing transaction"), progress);
-				update_ctr = 0;
-				if (idx1 < inputs_count - 1) {
-					idx1++;
-					phase2_request_next_input();
+				if(extra_data_len > 0) {
+					send_req_4_extradata(0, MIN(1024, extra_data_len));
 				} else {
-					idx1 = 0;
-					send_req_5_output();
+					if (!signing_sign_input()) {
+ 						return;
+					}
+					// since this took a longer time, update progress
+					signatures++;
+					progress = 500 + ((signatures * progress_step) >> PROGRESS_PRECISION);
+					layoutProgress(_("Signing transaction"), progress);
+					update_ctr = 0;
+					if (idx1 < inputs_count - 1) {
+						idx1++;
+						phase2_request_next_input();
+					} else {
+						idx1 = 0;
+						send_req_5_output();
+					}
+					return;
 				}
 			}
 			return;
-
+		case STAGE_REQUEST_4_EXTRADATA:
+			if (!tx_serialize_extra_data_hash(&ti, tx->extra_data.bytes, tx->extra_data.size)) {
+				fsm_sendFailure(FailureType_Failure_ProcessError, _("Failed to serialize extra data"));
+				signing_abort();
+				return;
+			}
+			if (ti.extra_data_received < extra_data_len) { // still some data remanining
+				send_req_4_extradata(ti.extra_data_received, MIN(1024, extra_data_len - ti.extra_data_received));
+				return;
+			}
+			if (!signing_sign_input()) {
+				return;
+			}
+			// since this took a longer time, update progress
+			signatures++;
+			progress = 500 + ((signatures * progress_step) >> PROGRESS_PRECISION);
+			layoutProgress(_("Signing transaction"), progress);
+			update_ctr = 0;
+			if (idx1 < inputs_count - 1) {
+				idx1++;
+				phase2_request_next_input();
+			} else {
+				idx1 = 0;
+				send_req_5_output();
+			}
+			return;
+		
 		case STAGE_REQUEST_SEGWIT_INPUT:
 			resp.has_serialized = true;
 			resp.serialized.has_signature_index = false;
@@ -1354,11 +1418,34 @@ void signing_txack(TransactionType *tx)
 				idx1 = 0;
 				send_req_segwit_witness();
 			} else {
-				send_req_finished();
-				signing_abort();
+				if(extra_data_len > 0)
+					send_req_5_extradata(0, MIN(1024, extra_data_len));
+				else {
+					send_req_finished();
+					signing_abort();
+				}
 			}
 			return;
 
+		case STAGE_REQUEST_5_EXTRADATA:
+			if (to.extra_data_received + tx->extra_data.size > extra_data_len) {
+				fsm_sendFailure(FailureType_Failure_ProcessError, _("Failed to serialize extra data"));
+				signing_abort();
+				return;
+			}
+			resp.has_serialized = true;
+			resp.serialized.has_serialized_tx = true;
+			memcpy(resp.serialized.serialized_tx.bytes, tx->extra_data.bytes, tx->extra_data.size);
+			resp.serialized.serialized_tx.size = tx->extra_data.size;
+			to.extra_data_received += tx->extra_data.size;
+			if (to.extra_data_received < extra_data_len) { // still some data remanining
+				send_req_5_extradata(to.extra_data_received, MIN(1024, to.extra_data_len - ti.extra_data_received));
+				return;
+			}
+			send_req_finished();
+			signing_abort();
+			return;
+		
 		case STAGE_REQUEST_SEGWIT_WITNESS:
 			if (!signing_sign_segwit_input(&tx->inputs[0])) {
 				return;

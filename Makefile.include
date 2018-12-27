@@ -5,7 +5,7 @@ ifneq ($(V),1)
 Q := @
 endif
 
-PYTHON ?= python
+PYTHON ?= python3
 
 ifeq ($(EMULATOR),1)
 CC       ?= gcc
